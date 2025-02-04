@@ -34,6 +34,13 @@ jobs:
     - name: Build with Maven
       run: ./mvnw -B package --file pom.xml
 
+    - name: Set the output value
+        run:echo "MY_OUTPUT=SomeValue" >> $GITHUB_ENV
+
+      # Access the output value in a later step
+    - name: Print output value
+        run:echo "The output value is ${{ env.MY_OUTPUT }}"
+
     # Optional: Uploads the full dependency graph to GitHub to improve the quality of Dependabot alerts this repository can receive
     - name: Update dependency graph
       uses: advanced-security/maven-dependency-submission-action@571e99aab1055c2e71a1e2309b9691de18d6b7d6

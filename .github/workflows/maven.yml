@@ -27,6 +27,10 @@ jobs:
         java-version: '17'
         distribution: 'temurin'
         cache: maven
+
+    - name: Give mvnw script execute permissions
+      run: chmod +x ./mvnw
+      
     - name: Build with Maven
       run: ./mvnw -B package --file pom.xml
 

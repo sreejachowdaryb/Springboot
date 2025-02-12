@@ -1,12 +1,11 @@
 name: deploy-components-cycle
-
 on:
   workflow_call:
     inputs:
       client_payload:
         required: true
         type: string
-        default: ""
+        default: ''
       max_parallel:
         required: false
         type: number
@@ -25,6 +24,7 @@ on:
 env:
   ACTIONS_ALLOW_UNSECURE_COMMANDS: true
   ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+  GH_TOKEN: ${{ github.token }}
 
 permissions:
   id-token: write
@@ -33,11 +33,11 @@ permissions:
 
 jobs:
   deploy-components-cycle:
-    runs-on:
+    runs-on: 
       group: enterprise/Default
-    labels: [ "self-hosted", "${{ matrix.env }}" ]
+      labels: [ "self-hosted", "${{ matrix.env }}" ]
     strategy:
-      fail-fast: false
+      fail-fast: false # This ensures other jobs don't get cancelled if 1 job fails. Workflow will still fail.
       matrix:
         include: "${{ fromJSON(inputs.client_payload)['matrix_include'] }}"
       max-parallel: ${{ inputs.max_parallel }}
@@ -47,7 +47,7 @@ jobs:
       COMPONENT_KEY: ${{ matrix.component }}
       PLATFORM_TYPE: ${{ matrix.platform_type }}
       LOCAL_TEST_ENV: edp-${{ fromJSON(inputs.client_payload)['workflows']['local_test_env'] }}
-      NEXUS_ENV: ${{ fromJSON(inputs.client_payload)['workflows']['local_test_env'] }}
+      NEXUS_ENV: "${{ fromJSON(inputs.client_payload)['workflows']['local_test_env'] }}"
       GITHUB_ENV: ${{ matrix.env == 'englab' && 'englab' || 'prod' }}
     environment:
       name: ${{ matrix.env }}
@@ -72,32 +72,39 @@ jobs:
         id: retrieve-lob-vault
         uses: hashicorp/vault-action@v3.0.0
         with:
+          # runner will only be englab, qa, dev, pat and prod
           url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
           method: jwt
           path: jwt_github
-          role: "pipe-github-workflow"
-          exportToken: true
+          role: "${{ fromJSON(inputs.client_payload)['onboarding_content']['onboarding']['malCode'] }}-${{ fromJSON(inputs.client_payload)['onboarding_content']['onboarding']['appName'] }}-edp-workflows"
+          exportToken: True
 
       - name: Rename LOB Vault Token
         if: steps.retrieve-lob-vault.outcome == 'success'
         id: rename-lob-token
         run: |
-          echo "LOB_VAULT_TOKEN=${{ env.VAULT_TOKEN }}" >> $GITHUB_ENV
+          echo "LOB_VAULT_TOKEN=${{env.VAULT_TOKEN}}" >> $GITHUB_ENV
 
       - name: Retrieve Azure Vault Secrets
         id: retrieve-azure-vault
         uses: hashicorp/vault-action@v3.0.0
         with:
+          # runner will only be englab, qa, dev, pat and prod
           url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
           method: jwt
           path: jwt_github
           role: pipe-github-workflow
           exportToken: true
+          secrets: |
+            pipe/data/csl/nexus-pull-username-${{ env.NEXUS_ENV }} nexus-pull-username-${{ env.NEXUS_ENV }} | NEXUS_PULL_USERNAME ;
+            pipe/data/csl/nexus-pull-password-${{ env.NEXUS_ENV }} nexus-pull-password-${{ env.NEXUS_ENV }} | NEXUS_PULL_PASSWORD ;
+            pipe/data/csl/servicenow_edpgt username | SN_USERNAME ;
+            pipe/data/csl/servicenow_edpgt password | SN_PASSWORD ;
 
       - name: Rename EDP Vault Token
         id: rename-edp-token
         run: |
-          echo "EDP_VAULT_TOKEN=${{ env.VAULT_TOKEN }}" >> $GITHUB_ENV
+          echo "EDP_VAULT_TOKEN=${{env.VAULT_TOKEN}}" >> $GITHUB_ENV
 
       - name: Checkout Branch
         id: checkout-branch
@@ -128,7 +135,7 @@ jobs:
         run: "python3 /app/main.py"
         env:
           INPUT_FUNCTION: "wait_dependent_components_deployment"
-          CLIENT_PAYLOAD: "${{ inputs.client_payload }}"
+          CLIENT_PAYLOAD: "${{  inputs.client_payload }}"
           GH_TOKEN: "${{ github.token }}"
 
       - name: Prepare Component Deployment
@@ -139,26 +146,37 @@ jobs:
           MALCODE: "${{ fromJSON(inputs.client_payload)['onboarding_content']['onboarding']['malCode'] }}"
           CLIENT_PAYLOAD: "${{ inputs.client_payload }}"
 
-      - name: Start Component Deployment
+      - name: ${{ env.PLATFORM_TYPE }} Component Deployment
         run: "python3 /app/main.py"
         env:
           INPUT_FUNCTION: "component_deployment"
+          MALCODE: "${{ fromJSON(inputs.client_payload)['onboarding_content']['onboarding']['malCode'] }}"
+          ARTIFACT_PARAMETERS: "${{ steps.prepare-component-deployment.outputs.artifact_parameters }}"
+          COMPONENT_PARAMETERS: "${{ steps.prepare-component-deployment.outputs.component_parameters }}"
+          DEPLOYMENT_PARAMETERS: "${{ steps.prepare-component-deployment.outputs.deployment_parameters }}"
+          INFRASTRUCTURE_PARAMETERS: "${{ steps.prepare-component-deployment.outputs.infrastructure_parameters }}"
+          EDP_CONTENT: "${{ toJSON(fromJSON(inputs.client_payload)['edp_content']) }}"
+          ONBOARDING_CONTENT: "${{ toJSON(fromJSON(inputs.client_payload)['onboarding_content']) }}"
 
       - name: Create deployment information
         id: create-deployment-info
         run: "python3 /app/main.py"
         env:
           INPUT_FUNCTION: "create_deployment_information"
+          ARTIFACT_PARAMETERS: "${{ steps.prepare-component-deployment.outputs.artifact_parameters }}"
+          WORKFLOWS_INFO: "${{ toJSON(fromJSON(inputs.client_payload)['workflows']) }}"
 
       - name: Upload deployment information
+        if: steps.create-deployment-info.outputs.deployment_info_file
         uses: actions/upload-artifact@v4
         with:
-          name: "${{ steps.create-deployment-info.outputs.artifact_name }}-${{ matrix.env }}-${{ matrix.component }}"
+          name: "${{ steps.create-deployment-info.outputs.artifact_name }}-${{matrix.env}}--${{matrix.component}}"
           path: "${{ steps.create-deployment-info.outputs.deployment_info_file }}"
           if-no-files-found: error
           retention-days: 7
 
       - name: Delete deployment information file
+        if: steps.create-deployment-info.outputs.deployment_info_file
         run: rm "${{ steps.create-deployment-info.outputs.deployment_info_file }}"
 
       - name: Send Notification
@@ -177,13 +195,75 @@ jobs:
         env:
           INPUT_FUNCTION: "clean_up_workspace"
 
-  continuous-testing:
-    runs-on:
+  commit-deployment-info:
+    runs-on: 
       group: enterprise/Default
-    labels: [ "self-hosted", "${{ matrix.env }}" ]
+      labels: [ "self-hosted", "${{ matrix.env }}" ]
     strategy:
       matrix:
-        include: "${{ fromJSON(inputs.client_payload)['workflows']['github_env'] }}"
+        include:
+          - env: "${{ fromJSON(inputs.client_payload)['workflows']['github_env'] }}"
+    needs: deploy-components-cycle
+    if: ${{ needs.deploy-components-cycle.outputs.artifact_name }}
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+      LOCAL_TEST_ENV: edp-${{ fromJSON(inputs.client_payload)['workflows']['local_test_env'] }}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+
+    steps:
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          # runner will only be englab or prod
+          # url: ${{ matrix.env == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          secrets: |
+            pipe/data/csl/github-saas-write-token-prod github-saas-write-token-prod | GH_WRITE_TOKEN ;
+
+      - name: Generate Github App Token
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_WRITE_TOKEN"
+
+      - name: Download deployment information artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "${{ needs.deploy-components-cycle.outputs.artifact_name }}-*"
+          merge-multiple: true
+
+      - name: Commit deployment information to central repository
+        id: commit-deployment-information
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "commit_deployment_information"
+
+      - name: Clean Up Runner Workspace
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "clean_up_workspace"
+
+  continuous-testing:
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "${{ matrix.env }}" ]
+    strategy:
+      matrix:
+        include:
+          - env: "${{ fromJSON(inputs.client_payload)['workflows']['github_env'] }}"
     needs: deploy-components-cycle
     env:
       CLOUD_ENV: ${{ matrix.env }}
@@ -201,22 +281,27 @@ jobs:
         id: retrieve-vault
         uses: hashicorp/vault-action@v3.0.0
         with:
+          # runner will only be englab or prod
+          # url: ${{ matrix.env == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
           url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
           method: jwt
           path: jwt_github
           role: pipe-github-workflow
           exportToken: true
+          secrets: |
+            pipe/data/csl/github-saas-admin-token-prod github-saas-admin-token-prod | GH_ADMIN_TOKEN ;
 
       - name: Generate Github App Token
         run: "python3 /app/main.py"
         env:
           INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_ADMIN_TOKEN"
 
       - name: Start Continuous Testing
         id: start_ct
         run: "python3 /app/main.py"
         env:
           INPUT_FUNCTION: "repository_dispatch"
-          GH_TOKEN: ${{ env.GH_ADMIN_TOKEN }}
-          EVENT_TYPE: "ct-selection-dispatch"
-          CLIENT_PAYLOAD: "${{ inputs.client_payload }}"
+          GH_TOKEN: ${{env.GH_ADMIN_TOKEN}}
+          EVENT_TYPE: 'ct-selection-dispatch'
+          CLIENT_PAYLOAD: ${{inputs.client_payload}}

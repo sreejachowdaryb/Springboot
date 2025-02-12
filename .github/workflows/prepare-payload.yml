@@ -1,0 +1,271 @@
+name: prepare-payload
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+        default: ''
+      target_branch:
+        required: false
+        type: string
+        default: ''
+      change_order:
+        required: false
+        type: string
+        default: ''
+      env_path:
+        required: false
+        type: string
+        default: ''
+      cycle:
+        required: false
+        type: string
+        default: ''
+      full_snapshot_cycle:
+        description: 'If false, will only trigger ci session.'
+        type: string
+        required: false
+      callerWorkflowVersion:
+        required: false
+        type: string
+        default: "3.35.0"
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+
+    outputs:
+      client_payload:
+        description: "The client payload for next workflow"
+        value: ${{ jobs.build-payload.outputs.client_payload }}
+      matrix_env:
+        description: "The matrix env to select runner valid values are englab and prod"
+        value: ${{ jobs.determine-environment.outputs.matrix_env }}
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+  LOCAL_TEST_ENV: edp-prod
+  GH_TOKEN: ${{ github.token }}
+  MINIMUM_CALLER_WORKFLOW_VERSION: 3.35.0
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  determine-environment:
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "Linux" ]
+    outputs:
+      matrix_env: ${{ env.LOCAL_TEST_ENV == 'edp-englab' && 'englab' || 'prod' }}
+    steps:
+      - name: Print environment variables
+        run: printenv
+
+  build-payload:
+    needs: determine-environment
+    # Possible Labels: self-hosted,{{cloud_env}},{{region}},non-pci,privileged,{{github_runner_vm_name}}"
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "Linux", "${{ matrix.env }}" ]
+    strategy:
+      matrix:
+        include:
+          - env: ${{ needs.determine-environment.outputs.matrix_env }}
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+      LOCAL_TEST_ENV: edp-${{ matrix.env }}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+    outputs:
+      client_payload: ${{ steps.build-its-event-payload.outputs.result }}
+
+    steps:
+      - name: Display Environments
+        run: env
+
+      - name: Validate Caller Workflow Version
+        id: validate-caller-workflow-version
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "validate_caller_workflow_version"
+          CALLER_WORKFLOW_VERSION: ${{ inputs.callerWorkflowVersion }}
+
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          # runner will only be englab or prod
+          # url: ${{ matrix.env == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          secrets: |
+            pipe/data/csl/github-saas-write-token-prod github-saas-write-token-prod | GH_WRITE_TOKEN ;
+            azcld/data/github/management/dd-integration-api-key main | DATADOG_API_KEY ;
+
+      - name: Checkout Branch
+        id: checkout-branch
+        uses: actions/checkout@v3
+        with:
+          ref: "${{ inputs.branch }}"
+          fetch-depth: 0
+
+      - name: Generate Github App Token
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_WRITE_TOKEN"
+
+      - name: Determine Event
+        id: deter-event
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "determine_event"
+          MATRIX_ENV: ${{ needs.determine-environment.outputs.matrix_env }}
+          EVENT_NAME: ${{ github.event_name }}
+          ENV_PATH: ${{ inputs.env_path }}
+          EVENT_CYCLE: ${{ inputs.cycle }}
+          BRANCH_NAME: ${{ inputs.branch }}
+          TAG: ${{ inputs.tag }}
+
+      - name: Parse EDP Version
+        id: parse-edp-version
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "parse_edp_version"
+
+      - name: Merge Pull Request
+        if: ${{ fromJSON(steps.deter-event.outputs.result).workflows.edp_cycle == 'open-pr-cycle' }}
+        id: merge-pull-request
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "merge_pull_request"
+          WORKFLOWS: ${{ toJSON(fromJSON(steps.deter-event.outputs.result).workflows) }}
+
+      - name: Parse EDP Operations File
+        id: parse-edp
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "parse_edp_file"
+          EDP_VERSION: "${{ fromJSON(steps.parse-edp-version.outputs.result).workflows.edp_version }}"
+
+      - name: Parse Onboarding File
+        id: parse-onboarding
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "parse_onboarding_file"
+
+      - name: Parse Infrastructure File
+        id: parse-infrastructure
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "parse_infrastructure_file"
+
+      - name: Parse Components
+        id: parse-components
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "parse_components"
+          CLIENT_PAYLOAD: ${{ steps.deter-event.outputs.result }}
+
+      - name: Validate EDP Supported Version
+        id: validate-edp-supported-version
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "validate_edp_supported_version"
+
+      - name: Validate Workflow Inputs
+        id: validate-workflow-inputs
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "validate_workflow_inputs"
+          CLIENT_PAYLOAD: ${{ steps.deter-event.outputs.result }}
+
+      - name: Validate Repository
+        id: validate-repo
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "validate_repository"
+          ONBOARDING_CONTENT: "${{ steps.parse-onboarding.outputs.result }}"
+          EDP_CONTENT: "${{ steps.parse-edp.outputs.result }}"
+          INFRASTRUCTURE_CONTENT: "${{ steps.parse-infrastructure.outputs.result }}"
+          COMPONENTS_CONTENT: "${{ steps.parse-components.outputs.result }}"
+
+      - name: Validate Releaseable Branch
+        if: ${{ fromJSON(steps.deter-event.outputs.result).workflows.edp_cycle == 'release-artifact-cycle' }}
+        id: validate-releaseable-branch
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "validate_releasable_branch"
+          ACTUAL_BRANCH: "${{ fromJSON(steps.deter-event.outputs.result).workflows.github_branch }}"
+
+      - name: Validate Tag
+        if: ${{ fromJSON(steps.deter-event.outputs.result).workflows.edp_cycle == 'release-artifact-cycle' || fromJSON(steps.deter-event.outputs.result).workflows.edp_cycle == 'release-cycle' }}
+        id: validate-tag
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "validate_git_tag"
+          GIT_TAG: "${{ fromJSON(steps.deter-event.outputs.result).workflows.github_tag }}"
+          EDP_TAG: "${{ fromJSON(steps.parse-edp.outputs.result).development.version }}"
+
+      - name: Build ITS Event Payload
+        id: build-its-event-payload
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "build_its_payload"
+          COMPONENTS_CONTENT: "${{ steps.parse-components.outputs.result }}"
+          EDP_CONTENT: "${{ steps.parse-edp.outputs.result }}"
+          ONBOARDING_CONTENT: "${{ steps.parse-onboarding.outputs.result }}"
+          INFRASTRUCTURE_CONTENT: "${{ steps.parse-infrastructure.outputs.result }}"
+          CLIENT_PAYLOAD: "${{ steps.deter-event.outputs.result }}"
+          FULL_SNAPSHOT_CYCLE: "${{ github.event.inputs.full_snapshot_cycle }}"
+          GH_TOKEN: "${{ github.token }}"      
+
+      - name: Validate Lob Version
+        if: ${{ fromJSON(steps.deter-event.outputs.result).workflows.edp_cycle == 'release-artifact-cycle' || fromJSON(steps.deter-event.outputs.result).workflows.edp_cycle == 'snapshot-cycle' }}
+        id: validate-lob-version
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "validate_lob_version"
+          CLIENT_PAYLOAD: ${{ steps.build-its-event-payload.outputs.result || steps.deter-event.outputs.result }}
+
+      - name: Send Datadog Tags
+        id: send-datadog-tags
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "send_datadog_pipeline_tags"
+          ONBOARDING_CONTENT: "${{ steps.parse-onboarding.outputs.result }}"
+          CLIENT_PAYLOAD: "${{ steps.build-its-event-payload.outputs.result }}"
+          GH_TOKEN: "${{ github.token }}"
+
+      - name: Send Notification
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "send_notification"
+          CLIENT_PAYLOAD: ${{ steps.build-its-event-payload.outputs.result || steps.deter-event.outputs.result }}
+          GH_TOKEN: "${{ github.token }}"
+          JOB_STATUS: "${{ job.status }}"
+          JOB_NAME_INCLUDE: "${{ matrix.env }}"
+
+      - name: Clean Up Runner Workspace
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "clean_up_workspace"

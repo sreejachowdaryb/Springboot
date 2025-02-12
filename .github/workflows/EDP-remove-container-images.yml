@@ -1,0 +1,175 @@
+name: Aquasec Scan Workflow
+on:
+  workflow_call:
+    inputs:
+      image_repository_regex:
+        required: true
+        type: string
+      image_registry_regex:
+        required: true
+        type: string
+        default: '*'
+      image_tag_regex:
+        required: false
+        type: string
+      image_digest:
+        type: string
+        required: false
+      image_retention_date:
+        type: string
+        required: false
+      dry_run:
+        type: boolean
+        required: true
+        default: true
+      environments:
+        type: string
+        required: true
+      change_order_number:
+        type: string
+        required: false
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+  GH_TOKEN: ${{ github.token }}
+  LOCAL_TEST_ENV: edp-prod
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  determine-environment:
+    name: Determine Environment
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "linux" ]
+    outputs:
+      matrix_env: ${{ env.LOCAL_TEST_ENV == 'edp-englab' && 'englab' || 'prod' }}
+    steps:
+      - name: Print environment variables
+        run: printenv
+
+  prepare-workflow:
+    name: Prepare Workflow
+    needs: 'determine-environment'
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "Linux", "${{ matrix.env }}"]
+    strategy:
+      matrix:
+        include:
+          - env: ${{ needs.determine-environment.outputs.matrix_env }}
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /etc/salt/grains:/etc/salt/grains
+    outputs:
+      onboarding_content: ${{ steps.parse-onboarding.outputs.result }}
+      workflow_matrix: ${{ steps.build-workflow-matrix.outputs.result }}
+    steps:
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          # runner will only be englab or prod
+          # url: ${{ matrix.env == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          secrets: |
+            pipe/data/csl/github-saas-write-token-prod github-saas-write-token-prod | GH_WRITE_TOKEN ;
+
+      - name: Generate Github App Token
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_WRITE_TOKEN"
+
+      - name: Parse Onboarding File
+        id: parse-onboarding
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "parse_onboarding_file"
+
+      - name: Build Workflow Matrix
+        id: build-workflow-matrix
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "build_workflow_matrix"
+          ENVIRONMENTS: ${{ inputs.environments }}
+  
+  remove-container-images:
+    name: "Remove Container Images"
+    needs: ['prepare-workflow']
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "Linux", "${{ matrix.env }}"]
+    strategy:
+      fail-fast: false # This ensures other jobs don't get cancelled if 1 job fails. Workflow will still fail.
+      matrix:
+        include: "${{ fromJSON(needs.prepare-workflow.outputs.workflow_matrix) }}"
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+      ONBOARDING_CONTENT: ${{ needs.prepare-workflow.outputs.onboarding_content }}
+    environment:
+      name: ${{ matrix.env }}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+    steps:
+      - name: Get Hashicorp Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Get Hashicorp Vault Token
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: True
+          secrets: |
+            pipe/data/csl/servicenow_edpgt username | SN_USERNAME ;
+            pipe/data/csl/servicenow_edpgt password | SN_PASSWORD ;
+
+      - name: Validate Change Order
+        id: validate-co
+        if: inputs.dry_run == 'false' && contains(fromJson('["pat", "prod"]'), matrix.env)
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "validate_co"
+          CO_NUMBER: ${{ inputs.change_order_number }}
+          ENV_PATH: ${{ matrix.env }}
+          ONBOARDING_CONTENT: "{}"
+
+      - name: Remove Images from Aquasec & Registries
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "aquasec_remove_images"
+          IMAGE_REPOSITORY_REGEX: ${{ inputs.image_repository_regex }}
+          IMAGE_REGISTRY_REGEX: ${{ inputs.image_registry_regex }}
+          IMAGE_TAG_REGEX: ${{ inputs.image_tag_regex }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          IMAGE_RETENTION_DATE: ${{ inputs.image_retention_date }}
+          DRY_RUN: ${{ inputs.dry_run }}

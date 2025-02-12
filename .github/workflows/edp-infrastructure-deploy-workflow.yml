@@ -1,0 +1,435 @@
+name: edp-infrastructure-deploy-workflow
+on:
+  workflow_call:
+  # workflow_dispatch:
+    inputs:
+      current_cycle:
+        description: 'Applicable EDP Cycles. Deploy to low env: ["snapshot-cycle"],  Deploy to high env: ["release-cycle"].'
+        required: true 
+        type: string
+        default: 'snapshot-cycle'
+      branch:
+        description: 'Applicable EDP Cycles: ["snapshot-cycle"]. Git branch to deploy on the snapshot-cycle'
+        required: false
+        type: string
+        default: ''
+      tag:
+        description: 'Applicable EDP Cycles: ["release-cycle"]. Git Tag to deploy on the release-cycle'
+        required: false
+        type: string
+        default: ''
+      env_path:
+        description: 'EDP Environment Path in the infrastructure.yml, dev, or full path, dev/englab'
+        required: false
+        type: string
+        default: "dev"
+      # notifications:
+      #   description: 'The notification configuration'
+      #   required: False
+      #   type: string
+      #   default: "{}"
+      max_parallel:
+        required: false
+        type: number
+        default: 2
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+    outputs:
+      # next_cycle:
+      #   description: "The next cycle to be triggered"
+      #   value: ${{ jobs.create-deploy-components-payload.outputs.next_cycle }}
+      client_payload:
+        description: "The payload for next"
+        value: ${{ jobs.create-deploy-components-payload.outputs.client_payload }}
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+  LOCAL_TEST_ENV: edp-prod
+  GH_TOKEN: ${{ github.token }}
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  prepare_dev_override:
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "linux" ]
+    outputs:
+      matrix_env: ${{ env.LOCAL_TEST_ENV == 'edp-englab' && 'englab' || 'prod' }}
+    steps:
+      - name: Print environment variables
+        run: printenv
+
+  build-payload:
+    needs: prepare_dev_override
+    # Possible Labels: self-hosted,{{cloud_env}},{{region}},non-pci,privileged,{{github_runner_vm_name}}"
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "linux", "${{ matrix.env }}" ]
+    strategy:
+      matrix:
+        include:
+          - env: ${{ needs.prepare_dev_override.outputs.matrix_env }}
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+      LOCAL_TEST_ENV: edp-${{ matrix.env }}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+    outputs:
+      client_payload: ${{ steps.build-event-payload.outputs.result }}
+
+    steps:
+      - name: display environments
+        run: env
+
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          # url: ${{ matrix.env == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          secrets: |
+            pipe/data/csl/github-saas-write-token-prod github-saas-write-token-prod | GH_WRITE_TOKEN;
+
+      - name: Checkout Branch
+        id: checkout-branch
+        uses: actions/checkout@v3
+        with:
+          ref: "${{ inputs.current_cycle == 'release-cycle' && inputs.tag || inputs.branch }}"
+          fetch-depth: 0
+
+      - name: Generate Github App Token
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_WRITE_TOKEN"
+
+      - name: Determine Event
+        id: deter-event
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "determine_event"
+          EDP_RELEASE_VERSION: ${{ env.EDP_RELEASE_VERSION }}
+          MATRIX_ENV: ${{ needs.prepare_dev_override.outputs.matrix_env }}
+          EVENT_NAME: ${{ github.event_name }}
+
+      - name: Parse EDP Version
+        id: parse-edp-version
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "parse_edp_version"
+
+      # webhook and notifyOn as inputs parameters
+      - name: Parse EDP Operations File
+        id: parse-edp
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "parse_edp_file"
+          EDP_VERSION: "${{ steps.parse-edp-version.outpus.workflows.edp_version }}"
+
+      # Enable this action only when we comment out "Parse EDP Version" and "Parse EDP Operations File"
+      # - name: Parse Notifications
+      #   id: parse-notifications
+      #   shell: python
+      #   run: |
+      #     import json
+
+      #     edp_content = {}
+      #     notifications_input = '${{ inputs.notifications }}'
+      #     edp_content['notifications'] = json.loads(notifications_input)
+      #     print(f"::set-output name=result::{ json.dumps(edp_content) }")
+
+      - name: Parse Onboarding File
+        id: parse-onboarding
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "parse_onboarding_file"
+
+      - name: Parse Infrastructure File
+        id: parse-infrastructure
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "parse_infrastructure_file"
+
+      - name: Build ITS Event Payload
+        id: build-its-event-payload
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "build_its_payload"
+          COMPONENTS_CONTENT: "{}"
+          EDP_CONTENT: "${{ steps.parse-edp.outputs.result }}"
+          # EDP_CONTENT: "${{ steps.parse-notifications.outputs.result }}"
+          ONBOARDING_CONTENT: "${{ steps.parse-onboarding.outputs.result }}"
+          INFRASTRUCTURE_CONTENT: "${{ steps.parse-infrastructure.outputs.result }}"
+          CLIENT_PAYLOAD: "${{ steps.deter-event.outputs.result }}"
+          GH_TOKEN: "${{ github.token }}"
+
+      - name: Build Next Cycle Payload
+        id: build-event-payload
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "build_next_cycle_payload2"
+          CLIENT_PAYLOAD: "${{ steps.build-its-event-payload.outputs.result }}"
+          ARTIFACTS: ""
+          CURRENT_CYCLE: "${{ inputs.current_cycle }}"
+          GH_TOKEN: "${{ github.token }}"
+
+      - name: Send Notification
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "send_notification"
+          CLIENT_PAYLOAD: ${{ steps.build-event-payload.outputs.result || steps.deter-event.outputs.result }}
+          GH_TOKEN: "${{ github.token }}"
+          JOB_STATUS: "${{ job.status }}"
+          JOB_NAME_INCLUDE: "${{ matrix.env }}"
+
+      - name: Clean Up Runner Workspace
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "clean_up_workspace"
+
+
+  create-infra-cycle: # when there is any infra be modified, it will go to this job to deploy infra
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "${{ matrix.env }}" ]
+    continue-on-error: true
+    if: toJSON(fromJSON(needs.build-payload.outputs.client_payload)['matrix_include']) != '[]'
+    strategy:
+      fail-fast: false # This ensures other jobs don't get cancelled if 1 job fails. Workflow will still fail.
+      matrix:
+        include: "${{ fromJSON(needs.build-payload.outputs.client_payload)['matrix_include'] }}"
+      max-parallel: ${{ inputs.max_parallel }}
+    needs: build-payload
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+      LOCAL_TEST_ENV: edp-${{ fromJSON(needs.build-payload.outputs.client_payload)['workflows']['local_test_env'] }}
+      ENV_PATH: ${{ matrix.env_path }}
+      TF_ACTION: ${{ matrix.tf_action }}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+    steps:
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          # runner will only be englab, qa, dev, pat and prod
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          secrets: |
+            pipe/data/csl/servicenow_edpgt username | SN_USERNAME ;
+            pipe/data/csl/servicenow_edpgt password | SN_PASSWORD ;
+            azcld/data/csl/terraform-api-token-${{ matrix.env }} terraform-api-token-${{ matrix.env }} | TF_TOKEN ;
+
+      - name: Checkout Branch
+        id: checkout-branch
+        uses: actions/checkout@v3
+        with:
+          ref: "${{ fromJSON(needs.build-payload.outputs.client_payload)['workflows']['github_ref'] }}"
+          fetch-depth: 0
+
+      - name: Terraform Setup
+        id: terraform-setup
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "terraform_setup"
+          ONBOARDING_CONTENT: "${{ toJSON(fromJSON(needs.build-payload.outputs.client_payload)['onboarding_content']) }}"
+          INFRASTRUCTURE_CONTENT: "${{ toJSON(fromJSON(needs.build-payload.outputs.client_payload)['infrastructure_content']) }}"
+          COMMIT: "${{ fromJSON(needs.build-payload.outputs.client_payload)['workflows']['github_commit_hash'] }}"
+
+      - name: Terraform Lint
+        id: terraform-lint
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "terraform_lint"
+          CLOUD_ENV: "${{ steps.terraform-setup.outputs.cloudVenueEnv }}"
+          PLAN_DIRECTORY: "${{ steps.terraform-setup.outputs.tfFolderPath }}"
+
+      - name: Terraform Validate
+        id: terraform-validate
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "terraform_validate"
+          CLOUD_ENV: "${{ steps.terraform-setup.outputs.cloudVenueEnv }}"
+          PLAN_DIRECTORY: "${{ steps.terraform-setup.outputs.tfFolderPath }}"
+
+      - name: Terraform Plan
+        id: terraform-plan
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "terraform_plan"
+          CLOUD_ENV: "${{ steps.terraform-setup.outputs.cloudVenueEnv }}"
+          COMMIT: "${{ fromJSON(needs.build-payload.outputs.client_payload)['workflows']['github_commit_hash'] }}"
+          GH_TOKEN: "${{ github.token }}"
+          PLAN_DIRECTORY: "${{ steps.terraform-setup.outputs.tfFolderPath }}"
+          TF_ORGANIZATION: "${{ steps.terraform-setup.outputs.tfOrganization }}"
+          TF_WORKSPACE_NAME: "${{ steps.terraform-setup.outputs.tfWorkspace }}"
+          TF_ACTION: "${{ matrix.tf_action }}"
+          FORCE_EXECUTE_RUN: True
+          SPECULATIVE_RUN: False
+          SUMMARY_COMMENT_TITLE: "${{ fromJSON(needs.build-payload.outputs.client_payload)['workflows']['terraform_summary_comment_title'] }}"
+
+      - name: Generate CCKM Key and Upload to AKV (BYOK)
+        if: ${{ matrix.tf_action != 'destroy' }}
+        id: cckm_akv_integration
+        uses: "docker://registry.td.com/td/azcld/cloud-eng-github-actions:3.41.2"
+        env:
+          INPUT_FUNCTION: "cckm_akv_integration"
+          TF_ORGANIZATION: "${{ steps.terraform-setup.outputs.tfOrganization }}"
+          TF_WORKSPACE_NAME: "${{ steps.terraform-setup.outputs.tfWorkspace }}"
+          TF_RUN_ID: "${{ steps.terraform-plan.outputs.tf_run_id }}"
+
+      - name: Terraform ${{ matrix.tf_action == 'destroy' && 'Destory' || 'Apply' }}
+        id: terraform-apply
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "terraform_apply"
+          CLOUD_ENV: "${{ steps.terraform-setup.outputs.cloudVenueEnv }}"
+          COMMIT: "${{ fromJSON(needs.build-payload.outputs.client_payload)['workflows']['github_commit_hash'] }}"
+          GH_TOKEN: "${{ github.token }}"
+          TF_ORGANIZATION: "${{ steps.terraform-setup.outputs.tfOrganization }}"
+          TF_WORKSPACE_NAME: "${{ steps.terraform-setup.outputs.tfWorkspace }}"
+          TF_RUN_ID: "${{ steps.terraform-plan.outputs.tf_run_id }}"
+          TF_ACTION: "${{ matrix.tf_action }}"
+          SUMMARY_COMMENT_TITLE: "${{ fromJSON(needs.build-payload.outputs.client_payload)['workflows']['terraform_summary_comment_title'] }}"
+
+      - name: Generate Azure Private Link DNS Records
+        if: ${{ matrix.tf_action != 'destroy' }}
+        id: azure_pep_integration
+        uses: "docker://registry.td.com/td/azcld/cloud-eng-github-actions:3.41.2"
+        env:
+          INPUT_FUNCTION: "azure_pep_integration"
+          TF_ORGANIZATION: "${{ steps.terraform-setup.outputs.tfOrganization }}"
+          TF_WORKSPACE_NAME: "${{ steps.terraform-setup.outputs.tfWorkspace }}"
+
+      - name: Post Terraform Deploy
+        if: ${{ matrix.tf_action != 'destroy' }}
+        id: post-terraform-deployment
+        uses: "docker://registry.td.com/td/azcld/cloud-eng-github-actions:3.41.2"
+        env:
+          INPUT_FUNCTION: "post_terraform_deployment"
+          TF_ORGANIZATION: "${{ steps.terraform-setup.outputs.tfOrganization }}"
+          TF_WORKSPACE_NAME: "${{ steps.terraform-setup.outputs.tfWorkspace }}"
+
+      - name: Send Notification
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "send_notification"
+          CLIENT_PAYLOAD: "${{ needs.build-payload.outputs.client_payload }}"
+          GH_TOKEN: "${{ github.token }}"
+          JOB_STATUS: "${{ job.status }}"
+          JOB_NAME_INCLUDE: "${{ matrix.env }}, ${{ matrix.env_path }}, ${{ matrix.tf_action }}"
+
+      - name: Clean Up Runner Workspace
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "clean_up_workspace"
+
+  Update_Terraform_Applied_Commit:
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "${{ matrix.env }}" ]
+    strategy:
+      matrix:
+        include:
+          - env: "${{ fromJSON(needs.build-payload.outputs.client_payload)['workflows']['github_env'] }}"
+    needs: [build-payload, create-infra-cycle]
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+      LOCAL_TEST_ENV: edp-${{ fromJSON(needs.build-payload.outputs.client_payload)['workflows']['local_test_env'] }}
+    # outputs:
+    #   next_cycle: ${{ steps.build-event-payload.outputs.next_cycle }}
+    #   client_payload: ${{ steps.build-event-payload.outputs.result }}
+
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+    steps:
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          # url: ${{ matrix.env == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          secrets: |
+            pipe/data/csl/github-saas-write-token-prod github-saas-write-token-prod | GH_WRITE_TOKEN ;
+
+      - name: Generate Github App Token
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_WRITE_TOKEN"
+
+      - name: Centralized Terraform Applied Commit Update
+        id: centralized-terraform-applied-commit-update
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "terraform_centralized_commit_update"
+          CLIENT_PAYLOAD: "${{ needs.build-payload.outputs.client_payload }}"
+
+      # - name: Build Next Cycle Payload
+      #   id: build-event-payload
+      #   run: "python3 /app/main.py"
+      #   env:
+      #     INPUT_FUNCTION: "build_next_cycle_payload2"
+      #     CLIENT_PAYLOAD: "${{ needs.build-payload.outputs.client_payload }}"
+      #     CURRENT_CYCLE: "create-infra-cycle"
+
+      - name: Send Notification
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "send_notification"
+          CLIENT_PAYLOAD: "${{ needs.build-payload.outputs.client_payload }}"
+          GH_TOKEN: "${{ github.token }}"
+          JOB_STATUS: "${{ job.status }}"
+          JOB_NAME_INCLUDE: "${{ matrix.env }}"
+
+      - name: Clean Up Runner Workspace
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "clean_up_workspace"

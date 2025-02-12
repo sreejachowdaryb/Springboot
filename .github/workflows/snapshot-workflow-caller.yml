@@ -1,0 +1,82 @@
+name: Snapshot Workflow Caller
+on:
+  workflow_dispatch:
+    inputs:
+      cycle:
+        type: choice
+        description: 'EDP Cycle To Run. Only choice is "snapshot-cycle" and it is required.'
+        required: true
+        options:
+          - snapshot-cycle
+        default: "snapshot-cycle"
+      branch:
+        description: 'Git branch from which to build the artifact.'
+        required: true
+        default: ""
+      env_path:
+        description: 'EDP Environment Path for create infrastructure and deploy component.'
+        required: false
+        default: "dev"
+      full_snapshot_cycle:
+        description: 'check, trigger full snapshot cycle. Uncheck, will only trigger ci session.'
+        type: boolean
+        required: true
+        default: true
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+      - release/*
+      - develop
+  repository_dispatch:
+    types: [byoci-snapshot]
+    # This trigger allows LOB to build their application with their own CI pipeline, publish the artifact to a nexus staging repository,
+    # then trigger the EDP workflow to continue the infrastructure creation and application deployment.
+    #
+    # The following json data must be provided when LOB trigger the byoci workflow using github REST API, the data provided here
+    # with the data in compnent definition merged should satisfy the json schema validation for the component.
+    # {
+    #     "event_type": "byoci-snapshot",
+    #     "client_payload": {
+    #         "branch": "feature/DEEDP-1981",
+    #         "version": "1.2.20-SNAPSHOT",
+    #         "full_snapshot_cycle": "true",
+    #         "env_path": "dev",
+    #         "components": {
+    #             "byoci-npm.yml": {
+    #                 "version": "1.2.6-SNAPSHOT",
+    #                 "binaryUrl": "https://dev.rp.td.com/repository/td-npm-releases/@com-td-pipe/pm2-hello-world/-/pm2-hello-world-1.2.6.tgz",
+    #                 "extension": "tgz"
+    #             },
+    #             "byoci-maven.yml": {
+    #                 "version": "2.0.2-SNAPSHOT",
+    #                 "assets": [
+    #                     {
+    #                         "binaryUrl": "https://dev.rp.td.com/repository/maven-all/org/springframework/boot/spring-boot/2.0.2.RELEASE/spring-boot-2.0.2.RELEASE.jar",
+    #                         "extension": "jar"
+    #                     },
+    #                     {
+    #                         "binaryUrl": "https://dev.rp.td.com/repository/maven-all/org/springframework/boot/spring-boot/2.0.2.RELEASE/spring-boot-2.0.2.RELEASE.pom",
+    #                         "extension": "pom"
+    #                     }
+    #                 ]
+    #             }
+    #         }
+    #     }
+    # }
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+jobs:
+  call-edp-gt-snapshot-workflow:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/edp-gt-snapshot-workflow.yml@EDP-RELEASE-3-N
+    with:
+      branch: ${{ github.event.inputs.branch || github.event.client_payload.branch || github.base_ref }}
+      full_snapshot_cycle: ${{ github.event.inputs.full_snapshot_cycle || github.event.client_payload.full_snapshot_cycle }}
+      env_path: ${{ github.event.inputs.env_path || github.event.client_payload.env_path }}
+      cycle: "snapshot-cycle"
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}

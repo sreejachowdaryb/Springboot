@@ -1,0 +1,26 @@
+name: CT selection workflow caller
+on:
+  workflow_dispatch:
+    inputs:
+      client_payload:
+        description: 'the CD client payload'
+        required: true
+        default: "{}"
+        
+  repository_dispatch:
+    types: [ct-selection-dispatch]
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  call-ct-workflow:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/ct-selection-workflow.yml@EDP-RELEASE-3-N
+    with:
+      client_payload: ${{inputs.client_payload || toJSON(github.event.client_payload)}}

@@ -1,0 +1,241 @@
+name: open-pr-cycle
+on:
+  workflow_call:
+    inputs:
+      client_payload:
+        required: true
+        type: string
+        default: ''
+      for_xl_ci:
+        required: false
+        type: boolean
+        default: false
+      callerWorkflowVersion:
+        required: false
+        type: string
+        default: "3.35.0"
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+    outputs:
+      sonarqube_result:
+        value: ${{ jobs.open-pr-cycle.outputs.sonarqube_result }}
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+  GH_TOKEN: ${{ github.token }}
+
+permissions:
+  id-token: write
+  contents: write
+  actions: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  open-pr-cycle:
+    # Possible Labels: self-hosted,{{cloud_env}},{{region}},non-pci,privileged,{{github_runner_vm_name}}"
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "${{ matrix.env }}"]
+    strategy:
+      matrix:
+        include:
+          - env: ${{ fromJSON(inputs.client_payload)['workflows']['matrix_env'] }}
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+      LOCAL_TEST_ENV: edp-${{ fromJSON(inputs.client_payload)['workflows']['local_test_env'] }}
+      FOR_XL_CI: ${{ inputs.for_xl_ci }}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+      options: --privileged
+    outputs:
+      sonarqube_result: ${{ steps.sonarqube-scan.outputs.sonarqube_result }}
+    steps:
+      - name: Checkout Branch
+        if: inputs.for_xl_ci == false
+        id: checkout-branch
+        uses: actions/checkout@v3
+        with:
+          ref: "${{ fromJSON(inputs.client_payload)['workflows']['github_ref'] }}"
+          fetch-depth: 0
+
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          # runner will only be englab or prod
+          # url: ${{ matrix.env == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          # NEXUS_PULL_USERNAME_PROD and NEXUS_PULL_PASSWORD_PROD are used to pull docker image from prod registry
+          # in englab runners, please don't remove
+          secrets: |
+            pipe/data/csl/sonarqube-token-${{ matrix.env }} sonarqube-token-${{ matrix.env }} | SONARQUBE_TOKEN ;
+            pipe/data/csl/sonarqube-push-username-${{ matrix.env }} sonarqube-push-username-${{ matrix.env }} | SONARQUBE_USERNAME ;
+            pipe/data/csl/github-saas-write-token-prod github-saas-write-token-prod | GH_WRITE_TOKEN ;
+            pipe/data/csl/github-saas-read-token-prod github-saas-read-token-prod | GH_READ_TOKEN ;
+            pipe/data/csl/aquasec-scanner-${{ matrix.env }} username | AQUASEC_SCANNER_USERNAME ;
+            pipe/data/csl/aquasec-scanner-${{ matrix.env }} password | AQUASEC_SCANNER_PASSWORD ;
+            pipe/data/csl/aquasec-rw-api-${{ matrix.env }} username | AQUASEC_API_USERNAME ;
+            pipe/data/csl/aquasec-rw-api-${{ matrix.env }} password | AQUASEC_API_PASSWORD ;
+            pipe/data/csl/veracode-api-cred-${{ matrix.env }} vid | VERACODE_API_VID ;
+            pipe/data/csl/veracode-api-cred-${{ matrix.env }} vkey | VERACODE_API_VKEY ;
+            azcld/data/csl/srcclr_api_token-${{ matrix.env }} main | SRCCLR_API_TOKEN ;
+            pipe/data/csl/nexus-pull-username-prod nexus-pull-username-prod | NEXUS_PULL_USERNAME_PROD ;
+            pipe/data/csl/nexus-pull-password-prod nexus-pull-password-prod | NEXUS_PULL_PASSWORD_PROD ;
+            pipe/data/csl/bitbucket-git-username-${{ matrix.env }} bitbucket-git-username-${{ matrix.env }} | BITBUCKET_GIT_USERNAME ;
+            pipe/data/csl/bitbucket-git-password-${{ matrix.env }} bitbucket-git-password-${{ matrix.env }} | BITBUCKET_GIT_PASSWORD ;
+            pipe/data/csl/${{ inputs.for_xl_ci == true && 'xlr-' || '' }}nexus-pull-username-${{ matrix.env }} nexus-pull-username-${{ matrix.env }} | NEXUS_PULL_USERNAME ;
+            pipe/data/csl/${{ inputs.for_xl_ci == true && 'xlr-' || '' }}nexus-pull-password-${{ matrix.env }} nexus-pull-password-${{ matrix.env }} | NEXUS_PULL_PASSWORD ;
+            pipe/data/csl/${{ inputs.for_xl_ci == true && 'xlr-' || '' }}nexus-push-username-${{ matrix.env }} nexus-push-username-${{ matrix.env }} | NEXUS_PUSH_USERNAME ;
+            pipe/data/csl/${{ inputs.for_xl_ci == true && 'xlr-' || '' }}nexus-push-password-${{ matrix.env }} nexus-push-password-${{ matrix.env }} | NEXUS_PUSH_PASSWORD ;
+            pipe/data/csl/${{ inputs.for_xl_ci == true && 'xlr-' || '' }}nuget-api-token-${{ matrix.env }} nuget-api-token-${{ matrix.env }} | NUGET_API_TOKEN ;
+            azcld/data/github/management/dd-integration-api-key main | DATADOG_API_KEY ;
+
+      # please note that this step is added to verify prod secret path exist for wizcli
+      # continue-on-error will ensure it does not impact any LOB
+      - name: Retrieve Wizcli Vault Secrets
+        id: retrieve-wizcli-vault
+        uses: hashicorp/vault-action@v3.0.0
+        continue-on-error: true
+        with:
+          # runner will only be englab or prod
+          # url: ${{ matrix.env == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          # NEXUS_PULL_USERNAME_PROD and NEXUS_PULL_PASSWORD_PROD are used to pull docker image from prod registry
+          # in englab runners, please don't remove
+          secrets: |
+            pipe/data/csl/wizcli-service-account-${{ matrix.env }} WIZ_CLIENT_ID | WIZ_CLIENT_ID ;
+            pipe/data/csl/wizcli-service-account-${{ matrix.env }} WIZ_CLIENT_SECRET | WIZ_CLIENT_SECRET ;
+      
+      - name: Generate Github App Token
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_READ_TOKEN,GH_WRITE_TOKEN"
+
+      - name: Checkout Bitbucket Repo for EDP XLR Build
+        if: inputs.for_xl_ci == true
+        id: checkout-bitbucket-repo
+        run: " python3 /app/main.py "
+        env:
+          INPUT_FUNCTION: "checkout_bitbucket_repo"
+          EVENT_PAYLOAD: "${{ inputs.client_payload }}"
+          GIT_URL: ${{ fromJSON(inputs.client_payload)['workflows']['bb_url'] }}
+          PROJECT: ${{ fromJSON(inputs.client_payload)['workflows']['bb_project'] }}
+          REPOSITORY: ${{ fromJSON(inputs.client_payload)['workflows']['bb_repository'] }}
+          BRANCH: ${{ fromJSON(inputs.client_payload)['workflows']['bb_branch'] }}
+
+      - name: Checkout Extra Bitbucket Repo for EDP XLR Build
+        if: inputs.for_xl_ci == true
+        id: checkout-extra-bitbucket-repo
+        run: " python3 /app/main.py "
+        env:
+          INPUT_FUNCTION: "checkout_extra_bitbucket_repo"
+          EVENT_PAYLOAD: "${{ inputs.client_payload }}"
+
+      - name: Validate Pull Request can be merged
+        id: merge-pull-request
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "validate_pull_request_can_be_merged"
+          EVENT_PAYLOAD: "${{ inputs.client_payload }}"
+          WORKFLOWS: "${{ toJSON(fromJSON(inputs.client_payload)['workflows']) }}"
+
+      - name: Build Artifacts
+        if: toJSON(fromJSON(inputs.client_payload)['components_content']) != '{}'
+        id: build-application
+        run: " python3 /app/main.py "
+        env:
+          INPUT_FUNCTION: "build_application"
+          EVENT_PAYLOAD: "${{ inputs.client_payload }}"
+          GH_TOKEN: "${{ github.token }}"
+      
+      - name: Wizcli Scan
+        if: toJSON(fromJSON(inputs.client_payload)['components_content']) != '{}'
+        id: wizcli-scan
+        run: " python3 /app/main.py "
+        continue-on-error: true
+        env:
+          INPUT_FUNCTION: "wizcli_scan"
+          EVENT_PAYLOAD: "${{ inputs.client_payload }}"
+          GH_TOKEN: "${{ github.token }}"
+
+      - name: Sonarqube Scan
+        if: toJSON(fromJSON(inputs.client_payload)['components_content']) != '{}'
+        id: sonarqube-scan
+        run: " python3 /app/main.py "
+        env:
+          INPUT_FUNCTION: "${{ contains(toJSON(fromJSON(inputs.client_payload)['components_content']), 'terraform-external-modules') && 'sonarqube_scan_terraform_module' || 'sonarqube_scan' }}"
+          EVENT_PAYLOAD: "${{ inputs.client_payload }}"
+          GH_TOKEN: "${{ github.token }}"
+
+      - name: Veracode Scan
+        if: toJSON(fromJSON(inputs.client_payload)['components_content']) != '{}'
+        id: veracode-scan
+        run: " python3 /app/main.py "
+        env:
+          INPUT_FUNCTION: "veracode_scan"
+          EVENT_PAYLOAD: "${{ inputs.client_payload }}"
+          GH_TOKEN: "${{ github.token }}"
+
+      - name: Validate Artifacts
+        if: toJSON(fromJSON(inputs.client_payload)['components_content']) != '{}'
+        id: validate-artifacts
+        run: " python3 /app/main.py "
+        env:
+          INPUT_FUNCTION: "validate_artifacts"
+
+      - name: Notify Bitbucket Build Status
+        if: ${{ always() && inputs.for_xl_ci == true && job.status != 'success'}}
+        run: " python3 /app/main.py "
+        env:
+          INPUT_FUNCTION: "notify_bitbucket_build_status"
+          GIT_URL: ${{ fromJSON(inputs.client_payload)['workflows']['bb_url'] }}
+          BRANCH: ${{ fromJSON(inputs.client_payload)['workflows']['bb_branch'] }}
+          BUILD_STATUS: "FAILED"
+
+      - name: Send Results to Datadog
+        if: |
+          always() &&
+          steps.sonarqube-scan.outputs.send_to_datadog == 'True'
+        id: send-datadog-dict
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "send_datadog_dict"
+          DATADOG_PAYLOAD: "${{ steps.sonarqube-scan.outputs.datadog_payload }}"
+          GH_TOKEN: "${{ github.token }}"
+          SILENT_RUN: "true"
+
+      - name: Send Notification
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "send_notification"
+          CLIENT_PAYLOAD: "${{ inputs.client_payload }}"
+          GH_TOKEN: "${{ github.token }}"
+          JOB_STATUS: "${{ job.status }}"
+          JOB_NAME_INCLUDE: "${{ matrix.env }}"
+
+      - name: Clean Up Runner Workspace
+        if: ${{ always() }}
+        run: " python3 /app/main.py "
+        env:
+          INPUT_FUNCTION: "clean_up_workspace"

@@ -1,0 +1,124 @@
+name: CT Selection Workflow
+on:
+  workflow_call:
+    inputs:
+      client_payload:
+        description: 'The client payload got from CD workflow'
+        required: true
+        type: string
+      callerWorkflowVersion:
+        required: false
+        type: string
+        default: "3.35.0"
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+  GH_TOKEN: ${{ github.token }}
+  LOCAL_TEST_ENV: edp-prod
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  determine-environment:
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "Linux" ]
+    outputs:
+      matrix_env: ${{ env.LOCAL_TEST_ENV == 'edp-englab' && 'englab' || 'prod' }}
+    steps:
+      - name: Print environment variables
+        run: printenv
+        
+  ct-workflow-selection:
+    needs: determine-environment
+    runs-on: 
+      group: enterprise/Default
+      labels: ["self-hosted", "${{ matrix.env }}"]
+    strategy:
+      matrix:
+        include:
+          - env: ${{ needs.determine-environment.outputs.matrix_env }}
+    outputs:
+      ct_selection: ${{steps.ct-workflow-selection.outputs.ct_selection}}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+      options: --privileged
+    steps:
+      - name: Checkout Branch
+        id: checkout-branch
+        uses: actions/checkout@v3
+        with:
+          ref: "${{ fromJSON(inputs.client_payload)['workflows']['github_ref'] }}"
+          fetch-depth: 0
+
+      - name: CT Workflow Selection
+        id: ct-workflow-selection
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "ct_workflow_selection"
+          MATRIX_ENV: ${{matrix.env}}
+          CLIENT_PAYLOAD: ${{inputs.client_payload}}
+        
+  ct-repository-dispatch:
+    if: ${{fromJson(needs.ct-workflow-selection.outputs.ct_selection)['ct_enabled']}}
+    needs: [determine-environment,ct-workflow-selection ]
+    runs-on: 
+      group: enterprise/Default
+      labels: ["self-hosted", "${{ matrix.env }}"]
+    env:
+      MATRIX_ENV: "${{ matrix.env }}"
+      CLOUD_ENV: ${{ matrix.env }}
+    strategy:
+      max-parallel: ${{fromJson(needs.ct-workflow-selection.outputs.ct_selection)['parallel']}}
+      fail-fast: ${{fromJson(needs.ct-workflow-selection.outputs.ct_selection)['fail-fast']}}
+      matrix: ${{fromJson(needs.ct-workflow-selection.outputs.ct_selection)['matrix']}}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+      options: --privileged
+    steps:
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          # runner will only be englab or prod
+          # url: ${{ env.MATRIX_ENV == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          # NEXUS_PULL_USERNAME_PROD and NEXUS_PULL_PASSWORD_PROD are used to pull docker image from prod registry
+          # in englab runners, please don't remove
+          secrets: pipe/data/csl/github-saas-admin-token-prod github-saas-admin-token-prod | GH_ADMIN_TOKEN
+
+      - name: Generate Github App Token
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_ADMIN_TOKEN"
+
+      - name: CT Remote Trigger
+        id: ct_remote_trigger
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "repository_dispatch_with_sync"
+          GH_TOKEN: ${{env.GH_ADMIN_TOKEN}}
+          REMOTE_REPOSITORY: "TD-Enterprise/${{matrix.repo}}"
+          EVENT_TYPE: 'ct-remote-dispatch'
+          SYNC: ${{fromJson(needs.ct-workflow-selection.outputs.ct_selection)['sync']}}
+          WORKFLOW_FILE: 'ct-workflow-caller.yml'
+          CLIENT_PAYLOAD: ${{fromJson(needs.ct-workflow-selection.outputs.ct_selection)['client_payloads'][matrix.payload_id]}}
+          ADDITIONAL_CLIENT_PAYLOAD: ${{fromJson(needs.ct-workflow-selection.outputs.ct_selection)['client_payloads']['common']}}

@@ -1,0 +1,156 @@
+name: Regression Testing
+run-name: Regression Testing
+on:
+  workflow_call:
+    inputs:
+      client_payload:
+        required: false
+        type: string
+        default: ''
+      config_branch:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+env:
+  GH_TOKEN: ${{ github.token }} 
+  LOCAL_TEST_ENV: edp-prod
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  determine-environment:
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "Linux" ]
+    outputs:
+      matrix_env: ${{ env.LOCAL_TEST_ENV == 'edp-englab' && 'englab' || 'prod' }}
+    steps:
+      - name: Print environment variables
+        run: printenv
+
+
+  Regression-Testing:
+    needs: determine-environment
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "${{ matrix.env }}" ]
+    strategy:
+      matrix:
+        include:
+          - env: ${{ needs.determine-environment.outputs.matrix_env }}
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+    outputs:
+      emails: ${{ steps.prepare-regression-notification.outputs.emails }}
+      subject: ${{ steps.prepare-regression-notification.outputs.subject }}
+      message: ${{ steps.prepare-regression-notification.outputs.message }}
+    steps:
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Azure Vault Secrets
+        id: retrieve-azure-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          # runner will only be englab, qa, dev, pat and prod
+          # url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          url: ${{ matrix.env == 'englab' && 'https://vault-e.englab.azure.td.com' || 'https://vault-e.prod.azure.td.com' }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          secrets: |
+            pipe/data/csl/github-saas-write-token-prod github-saas-write-token-prod | GH_WRITE_TOKEN ;
+            pipe/data/csl/github-saas-admin-token-prod github-saas-admin-token-prod | GH_ADMIN_TOKEN ;
+            pipe/data/csl/servicenow_edpgt username | SN_USERNAME ;
+            pipe/data/csl/servicenow_edpgt password | SN_PASSWORD ;
+            azcld/data/github/management/dd-integration-api-key main | DATADOG_API_KEY ;
+
+      - name: Generate Github App Token
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_WRITE_TOKEN,GH_ADMIN_TOKEN"
+
+      - name: Read regression config
+        id: read-regression-config
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "build_regression_payload"
+          CONFIG_BRANCH: ${{ inputs.config_branch }}
+
+      - name: Trigger regression testing
+        id: regression-trigger
+        if: steps.read-regression-config.outputs.regression_testing == 'True'
+        run: python3 /app/main.py
+        env:
+          INPUT_FUNCTION: regression_trigger
+          PAYLOAD: ${{ steps.read-regression-config.outputs.regression_payload }}
+
+      - name: Track test runs
+        if: always() && steps.read-regression-config.outputs.regression_testing == 'True'
+        run: python3 /app/main.py
+        id: regression-tracker
+        env:
+          INPUT_FUNCTION: regression_tracker
+          PAYLOAD: ${{ steps.read-regression-config.outputs.regression_payload }}
+          RUNS_TO_TRACK: ${{ steps.regression-trigger.outputs.runs_to_track }}
+          
+      - name: Prepare Regression Notification
+        if: always() && steps.read-regression-config.outputs.regression_testing == 'True'
+        run: "python3 /app/main.py"
+        id: prepare-regression-notification
+        env:
+          INPUT_FUNCTION: "regression_notifier"
+          PAYLOAD: ${{ steps.read-regression-config.outputs.regression_payload }}
+          GH_TOKEN: "${{ github.token }}"
+          JOB_STATUS: "${{ job.status }}"
+          JOB_NAME_INCLUDE: "${{ matrix.env }}"
+          RESULTS: ${{ steps.regression-tracker.outputs.regression_results }}
+          TRIGGER_ERRORS: ${{ steps.regression-trigger.outputs.trigger_errors }}
+
+      - name: Send Results to Datadog
+        if: |
+          always() &&
+          steps.read-regression-config.outputs.regression_testing == 'True' &&
+          steps.regression-tracker.outputs.send_to_datadog == 'True'
+        id: send-datadog-dict
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "send_datadog_dict"
+          DATADOG_PAYLOAD: "${{ steps.regression-tracker.outputs.regression_results }}"
+          GH_TOKEN: "${{ github.token }}"
+          SILENT_RUN: "false"
+
+      - name: Regression cleanup
+        if: always() && steps.read-regression-config.outputs.regression_testing == 'True'
+        run: python3 /app/main.py
+        env:
+          INPUT_FUNCTION: regression_cleanup
+          CLEANUP_REPOS: ${{ steps.regression-trigger.outputs.cleanup_repos }}
+
+  Send-Email:
+    needs: Regression-Testing
+    if: always() && needs.Regression-Testing.outputs.emails
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/send-email-workflow.yml@3.41.2
+    with:
+      to: ${{ needs.Regression-Testing.outputs.emails }}
+      subject: ${{ needs.Regression-Testing.outputs.subject }}
+      message: ${{ needs.Regression-Testing.outputs.message }}
+      encoded: true

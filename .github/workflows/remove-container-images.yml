@@ -1,0 +1,73 @@
+name: Remove Container Images
+on:
+  workflow_dispatch:
+    inputs:
+      image_repository_regex:
+        type: string
+        description: 'Provide the image repository to be removed. Running containers will be skipped. Regular expression is supported. Example: td/<malcode>/<image-name> or td/<malcode>/<partial-image-name>.*'
+        required: true
+        default: "td/malcode/springboot-hello-world"
+      image_registry_regex:
+        type: string
+        description: 'Registry host in which to remove images from. Regular expression is supported. Example: .*.registry.td.com for NEXUS registries or .* for all registries'
+        required: true
+        default: '.*'
+      image_tag_regex:
+        type: string
+        description: 'Optional Filter 1 - Image tag to be removed. Regular expression is supported. Example: 1.0.0 or 1.0.* or .* or 1.0.0|1.0.1|1.0.2'
+        required: false
+      image_digest:
+        type: string
+        description: 'Optional Filter 2 - Image digest to be removed. Example: sha256:75d917cfabb87d47f79f370683700d888f2441dd1aee0a7acfacbd8d6ebd6dff)'
+        required: false
+      image_retention_date:
+        type: string
+        description: 'Optional Filter 3 - Image retention date in YYYY-MM-DD. Any images built on or before this date will be removed. Example: 2023-12-31'
+        required: false
+      environments:
+        type: choice
+        description: 'What environment(s) to remove images in.'
+        required: true
+        options:
+          - "DEV"
+          - "PAT"
+          - "PROD"
+          - "DEV, PAT"
+          - "DEV, PROD"
+          - "PAT, PROD"
+          - "DEV, PAT, PROD"
+      change_order_number:
+        type: string
+        description: 'Change Order Number which is in Implement Stage. Required for PAT/PROD when Dry Run is disabled.'
+        default: 'CHGXXXXXXX'
+        required: false
+      dry_run:
+        type: boolean
+        description: 'Dry Run? Workflow execution will show what images would be deleted.'
+        default: true
+        required: true
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  remove-container-images:
+    name: "Remove Container Images"
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/remove-container-images.yml@EDP-RELEASE-3-N
+    with:
+      image_repository_regex: ${{ github.event.inputs.image_repository_regex }}
+      image_registry_regex: ${{ github.event.inputs.image_registry_regex }}
+      image_tag_regex: ${{ github.event.inputs.image_tag_regex }}
+      image_digest: ${{ github.event.inputs.image_digest }}
+      image_retention_date: ${{ github.event.inputs.image_retention_date }}
+      dry_run: ${{ github.event.inputs.dry_run == 'true' }}
+      environments: ${{ github.event.inputs.environments }}
+      change_order_number: ${{ github.event.inputs.change_order_number }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}

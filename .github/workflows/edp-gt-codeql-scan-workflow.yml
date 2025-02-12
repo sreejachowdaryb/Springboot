@@ -1,0 +1,28 @@
+name: edp-gt-codeql-scan-workflow
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+        default: ''
+      callerWorkflowVersion:
+        required: false
+        type: string
+        default: "3.35.0"
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+jobs:
+  call-codeql-scan-workflow:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/codeql-scan-workflow.yml@3.41.2
+    with:
+      branch: ${{ inputs.branch }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}

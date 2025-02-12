@@ -1,0 +1,105 @@
+version: "3.4"
+
+services:
+  backend:
+    image: registry.td.com/td/swe2/application/gsi_fraud_investigation-backend:1.0.1-SNAPSHOT
+    build: backend
+    platform: linux/amd64
+    depends_on:
+      mssql:
+        condition: service_healthy
+    environment:
+      - MSSQL_SA_PASSWORD=${MSSQL_PASSWORD}
+      - MSSQL_SA_USERNAME=${MSSQL_USERNAME}
+      - MSSQL_SA_URL=${MSSQL_URL}
+    ports:
+      - 8443:8443
+
+  frontend:
+    image: registry.td.com/td/swe2/application/gsi_fraud_investigation-frontend:1.0.1-SNAPSHOT
+    build: frontend
+    platform: linux/amd64
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      - API_URL=http://backend:8443
+      - AUTH_URL=https://fed1.sys.tdbank.ca # Prod Pingfed
+      # - AUTH_URL=https://dev.cnft.td.com:11014 # Mock Pingfed
+      - REDIRECT_HOST=http://localhost:8080
+    volumes:
+      - ./frontend/app:/myapp/app
+      - ./frontend/tsconfig.json:/myapp/tsconfig.json
+    ports:
+      - 8080:8080
+
+  mssql:
+    image: registry.td.com/td/vendor/mssql/server:2022-CU4-ubuntu-20.04
+    healthcheck:
+      start_period: 10s
+      test: "/opt/mssql-tools/bin/sqlcmd -S mssql -U ${MSSQL_USERNAME} -P ${MSSQL_PASSWORD} -d master -q 'select 1'"
+    environment:
+      - MSSQL_SA_PASSWORD=${MSSQL_PASSWORD}
+      - ACCEPT_EULA=Y
+    ports:
+      - 1433:1433
+
+  mssql_setup:
+    image: registry.td.com/td/vendor/mssql/server:2022-CU4-ubuntu-20.04
+    environment:
+      - ACCEPT_EULA=Y
+    depends_on:
+      mssql:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./mssql:/app
+    entrypoint: ["bash", "-eux", "-c"]
+    command:
+      [
+        "/opt/mssql-tools/bin/sqlcmd -S mssql -U ${MSSQL_USERNAME} -P ${MSSQL_PASSWORD} -d master -i ./SqlCmdScript.sql",
+      ]
+
+  selenium_grid:
+    profiles: [dockerhub]
+    image: dockerhub.registry.td.com/selenium/hub:4.18
+    security_opt:
+      - seccomp:unconfined
+    depends_on:
+      frontend:
+        condition: service_healthy
+    ports:
+      - 4442:4442
+      - 4443:4443
+      - 4444:4444
+
+  chrome:
+    profiles: [dockerhub]
+    image: dockerhub.registry.td.com/selenium/node-chrome:4.18
+    shm_size: 2gb
+    security_opt:
+      - seccomp:unconfined
+    depends_on:
+      selenium_grid:
+        condition: service_started
+    environment:
+      - SE_EVENT_BUS_HOST=selenium_grid
+      - SE_EVENT_BUS_PUBLISH_PORT=4442
+      - SE_EVENT_BUS_SUBSCRIBE_PORT=4443
+      - SE_NODE_GRID_URL=http://selenium_grid:4444
+      - SE_OPTS=--enable-managed-downloads true
+      - HUB_HOST=selenium_grid
+      - HUB_PORT=4444
+      - NODE_MAX_INSTANCES=1
+      - NODE_MAX_SESSION=1
+      - BROWSER_NAME=chrome
+    ports:
+      - 5555:5555
+
+  nextgen:
+    profiles: [dockerhub]
+    build: ./nextgen-selenium
+    platform: linux/amd64
+    depends_on:
+      chrome:
+        condition: service_started

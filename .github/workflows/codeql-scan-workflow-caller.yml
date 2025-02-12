@@ -1,0 +1,24 @@
+name: CodeQL Scan Workflow Caller
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches:
+      - main
+      - release/*
+      - develop
+  push:
+    branches:
+      - main
+      - release/*
+      - develop
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+
+jobs:
+  call-edp-gt-codeql-scan-workflow:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/edp-gt-codeql-scan-workflow.yml@EDP-RELEASE-3-N
+    with:
+      branch: ${{ github.event.pull_request.head.ref || github.ref_name }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}

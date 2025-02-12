@@ -1,0 +1,30 @@
+name: SIT-on-GitHub
+on:
+  push: { branches: [ main ] }
+  pull_request:
+
+# Somehow Github Pages is being implicitly invoked even though we don't ask for it ¯\_(ツ)_/¯
+# Fix "Error: Error message: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable"
+# Lifted from: https://stackoverflow.com/a/74167257
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+env:
+  #Workaround: https://track.td.com/browse/PTSEPEPG-2246
+  DOCKER_BUILDKIT: 0
+
+jobs:
+  test:
+    name: Run test suite
+    runs-on: ["self-hosted", "Linux", "prod", "azcldgthr-ib09"]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3 # TODO: upgrade to v4 once Node20 support lands; Fixes https://github.com/TD-Enterprise/GSI_Fraud_Investigation/actions/runs/8161585389/job/22310676781#step:2:16
+    - name: Build project
+      run: make build
+    - name: Boot environment
+      run: make env-up
+    - name: Run tests
+      run: make test

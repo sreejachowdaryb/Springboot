@@ -1,0 +1,90 @@
+name: edp-gt-release-workflow
+on:
+  workflow_call:
+    inputs:
+      cycle:
+        type: string
+        description: 'EDP Cycle To Run. Only choice is "release-cycle" and it is required.'
+        required: true
+        default: "release-cycle"
+      tag:
+        description: 'Git Tag to deploy on the release-cycle'
+        required: true
+        type: string
+        default: ""
+      ci_repo:
+        description: 'The repository that builds the artifact to be deployed, if not provided, current repository will be used.'
+        required: false
+        type: string
+        default: ""
+      ci_tag:
+        description: 'The version of the artifact to be deployed, if not provided, tag above will be used'
+        required: false
+        type: string
+        default: ""
+      env_path:
+        description: 'DP Environment Path Above DEV Classification To Release To'
+        required: false
+        type: string
+        default: "sit"
+      change_order:
+        description: 'Applicable EDP Cycles: ["release-cycle"]. Change Order to deploy on the release-cycle. Update Change Order to Implement state before starting release-cycle'
+        required: false
+        type: string
+        default: ""
+      callerWorkflowVersion:
+        required: false
+        type: string
+        default: "3.35.0"
+    secrets:
+        ACTIONS_CONTAINER_DEBUG:
+            required: false
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+jobs:
+  call-prepare-payload:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/prepare-payload.yml@3.41.2
+    with:
+      branch: ${{ inputs.tag }}
+      change_order: ${{ inputs.change_order }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-release-workflow:
+    needs: call-prepare-payload
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/release-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-prepare-payload.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-create-infra-workflow:
+    needs: call-release-workflow
+    if: needs.call-release-workflow.outputs.next_cycle == 'create-infra-cycle'
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/create-infra-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-release-workflow.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-deploy-components-workflow-after-release:
+    needs: call-release-workflow
+    if: needs.call-release-workflow.outputs.next_cycle == 'deploy-components-cycle'
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/deploy-components-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-release-workflow.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-deploy-components-workflow-after-create-infra:
+    needs: call-create-infra-workflow
+    if: needs.call-create-infra-workflow.outputs.next_cycle == 'deploy-components-cycle'
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/deploy-components-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-create-infra-workflow.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}

@@ -1,0 +1,117 @@
+name: Release Artifact Workflow Caller
+on:
+  workflow_dispatch:
+    inputs:
+      cycle:
+        type: choice
+        description: 'RRMINDER: Run the approval Workflow first! EDP Cycle To Run. Only choice is "release-artifact-cycle" and it is required.'
+        required: true
+        options:
+          - release-artifact-cycle
+        default: "release-artifact-cycle"
+      tag:
+        description: 'Git Tag to create on the release-artifact-cycle. If it is not provide, the ${development.version} in EDP.yml will be used.'
+        required: false
+        default: ""
+      branch:
+        description: 'Git Branch to build release artifact off of.'
+        required: true
+        default: ""
+  repository_dispatch:
+    types: [byoci-release]
+    # This trigger allows LOB to build their application with their own CI pipeline, publish the artifact to a nexus staging repository,
+    # then trigger the EDP workflow to continue the infrastructure creation and application deployment.
+    #
+    # The following json data must be provided when LOB trigger the byoci workflow using github REST API, the data provided here merged
+    # with the data in compnent definition should satisfy the json schema validation for the component.
+    # {
+    #     "event_type": "byoci-release",
+    #     "client_payload": {
+    #         "branch": "main",
+    #         "version": "1.2.20",
+    #         "components": {
+    #             "byoci-npm.yml": {
+    #                 "version": "1.2.6",
+    #                 "binaryUrl": "https://dev.rp.td.com/repository/td-npm-releases/@com-td-pipe/pm2-hello-world/-/pm2-hello-world-1.2.6.tgz",
+    #                 "extension": "tgz"
+    #             },
+    #             "byoci-maven.yml": {
+    #                 "version": "2.0.2",
+    #                 "assets": [
+    #                     {
+    #                         "binaryUrl": "https://dev.rp.td.com/repository/maven-all/org/springframework/boot/spring-boot/2.0.2.RELEASE/spring-boot-2.0.2.RELEASE.jar",
+    #                         "extension": "jar"
+    #                     },
+    #                     {
+    #                         "binaryUrl": "https://dev.rp.td.com/repository/maven-all/org/springframework/boot/spring-boot/2.0.2.RELEASE/spring-boot-2.0.2.RELEASE.pom",
+    #                         "extension": "pom"
+    #                     }
+    #                 ]
+    #             }
+    #         }
+    #     }
+    # }
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+jobs:
+  call-edp-gt-release-artifact-workflow:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/edp-gt-release-artifact-workflow.yml@EDP-RELEASE-3-N
+    with:
+      branch: ${{ github.event.inputs.branch || github.event.client_payload.branch }}
+      tag: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
+      cycle: "release-artifact-cycle"
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+	  
+	  =========================================================================
+name: edp-gt-release-artifact-workflow
+on:
+  workflow_call:
+    inputs:
+      cycle:
+        description: 'EDP Cycle To Run. Only choice is "release-artifact-cycle" and it is required.'
+        required: true
+        type: string
+        default: "release-artifact-cycle"
+      tag:
+        description: 'Git Tag to create on the release-artifact-cycle. If it is not provide, the ${development.version} in EDP.yml will be used.'
+        required: false
+        type: string
+        default: ""
+      branch:
+        description: 'Git Branch to build release artifact off of.'
+        required: true
+        type: string
+        default: ""
+      callerWorkflowVersion:
+        required: false
+        type: string
+        default: "3.35.0"
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false    
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+jobs:
+  call-prepare-payload:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/prepare-payload.yml@3.41.2
+    with:
+      branch: ${{ inputs.branch }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-build-and-publish-workflow:
+    needs: call-prepare-payload
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/release-artifact-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-prepare-payload.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}

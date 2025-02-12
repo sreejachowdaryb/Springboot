@@ -1,0 +1,42 @@
+name: Snapshot CD Workflow Caller
+on:
+  workflow_dispatch:
+    inputs:
+      cycle:
+        type: choice
+        description: 'EDP Cycle To Run. Only choice is "snapshot-cycle" and it is required.'
+        required: true
+        options:
+          - snapshot-cycle
+        default: "snapshot-cycle"
+      branch:
+        description: 'Git branch from which to get the EDP configuration files.'
+        required: true
+        default: ""
+      env_path:
+        description: 'EDP Environment Path Above DEV Classification To Release To'
+        required: false
+        default: "dev"
+      ci_repo_name:
+        description: 'The repository name that published the artifact, default is the current repository'
+        required: false
+      artifact_info_key:
+        description: 'The artifact_info_key used to retrieve the artifact info from CI repository'
+        required: true
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+jobs:
+  call-edp-gt-snapshot-cd-workflow:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/edp-gt-snapshot-cd-workflow.yml@EDP-RELEASE-3-N
+    with:
+      branch: ${{ github.event.inputs.branch || github.event.client_payload.branch || github.base_ref }}
+      env_path: ${{ github.event.inputs.env_path || github.event.client_payload.env_path }}
+      ci_repo_name: ${{ github.event.inputs.ci_repo_name || github.event.client_payload.ci_repo_name }}
+      artifact_info_key: ${{ github.event.inputs.artifact_info_key || github.event.client_payload.artifact_info_key }}
+      cycle: "snapshot-cycle"
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}

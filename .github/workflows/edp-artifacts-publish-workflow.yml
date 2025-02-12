@@ -1,0 +1,171 @@
+name: edp-artifacts-publish-workflow
+on:
+  workflow_call:
+  # workflow_dispatch:
+    inputs:
+      artifact_name:
+        required: false
+        type: string
+        default: ''
+      repo_type:
+        required: true
+        type: string
+        default: ''
+      repository:
+        required: false
+        type: string
+        default: ''
+      version:
+        required: false
+        type: string
+        default: ''
+      artifact_id:
+        required: false
+        type: string
+        default: ''
+      group_id:
+        required: false
+        type: string
+        default: ''
+      directory:
+        required: false
+        type: string
+        default: ''
+      extension:
+        required: true
+        type: string
+      include_patterns:
+        required: false
+        type: string
+        default: ''
+      artifacts_extension_json:
+        required: false
+        type: string
+        default: ''
+      workflow_run_id:
+        required: true
+        type: string
+        default: ''
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+    # outputs:
+    #   deployment_artifact:
+    #     value: ${{ jobs.artifact-publish.outputs.deployment_artifact }}
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+  LOCAL_TEST_ENV: edp-prod
+  GH_TOKEN: ${{ github.token }}
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  prepare_dev_override:
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "linux" ]
+    outputs:
+      matrix_env: ${{ env.LOCAL_TEST_ENV == 'edp-englab' && 'englab' || 'prod' }}
+    steps:
+      - name: Print environment variables
+        run: printenv
+
+  artifact-publish:
+    needs: prepare_dev_override
+    # Possible Labels: self-hosted,{{cloud_env}},{{region}},non-pci,privileged,{{github_runner_vm_name}}"
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "linux", "${{ matrix.env }}" ]
+    strategy:
+      matrix:
+        include:
+          - env: ${{ needs.prepare_dev_override.outputs.matrix_env }}
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+      LOCAL_TEST_ENV: edp-${{ matrix.env }}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+    # outputs:
+    #   deployment_artifact: ${{ steps.artifact-publish.outputs.deployment_artifact }}
+    steps:
+      - name: display environments
+        run: env
+
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets for Nexus Publish
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+        # runner will only be englab or prod
+          # url: ${{ matrix.env == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          secrets: |
+            pipe/data/csl/nexus-pull-username-${{ matrix.env }} nexus-pull-username-${{ matrix.env }} | NEXUS_PULL_USERNAME ;
+            pipe/data/csl/nexus-pull-password-${{ matrix.env }} nexus-pull-password-${{ matrix.env }} | NEXUS_PULL_PASSWORD ;
+            pipe/data/csl/nexus-push-username-${{ matrix.env }} nexus-push-username-${{ matrix.env }} | NEXUS_PUSH_USERNAME ;
+            pipe/data/csl/nexus-push-password-${{ matrix.env }} nexus-push-password-${{ matrix.env }} | NEXUS_PUSH_PASSWORD ;
+            pipe/data/csl/github-saas-write-token-prod github-saas-write-token-prod | GH_WRITE_TOKEN ;
+
+      - name: Generate Github App Token
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_WRITE_TOKEN"
+
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: nexus-artifacts-to-upload
+
+      - name: Artifact Publish to Nexus
+        id: artifact-publish
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "artifact_publish"
+          ARTIFACT_DIRECTORY: nexus-artifacts-to-upload
+          REPOSITORY: ${{ inputs.repository }}
+          REPO_TYPE: ${{ inputs.repo_type }}
+          VERSION: ${{ inputs.version }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          GROUP_ID: ${{ inputs.group_id }}
+          DIRECTORY: ${{ inputs.directory }}
+          EXTENSION: ${{ inputs.extension }}
+          INCLUDE_PATTERNS: ${{ inputs.include_patterns }}
+          ARTIFACT_EXTENSION_JSON: ${{ inputs.artifacts_extension_json }}
+
+      - name: Store Artifact Json as File
+        if: inputs.workflow_run_id != ''
+        run: |
+          echo '${{ steps.artifact-publish.outputs.deployment_artifact }}' > artifact.json
+
+      - name: Upload Artifact Json
+        if: inputs.workflow_run_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.workflow_run_id }}
+          path: artifact.json
+          retention-days: 1
+
+      - name: Clean Up Runner Workspace
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "clean_up_workspace"

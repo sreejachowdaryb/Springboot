@@ -1,0 +1,55 @@
+name: Update Workflows Caller
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Select EDP Release Channel:
+        1. N - Always run EDP on the Latest version
+        2. N-1 - Always run EDP one version behind (Regular)
+        3. N-2 - Always run EDP two versions behind (Stable)
+        NOTE: EDP generally releases a new version biweekly.'
+        required: true
+        type: choice
+        default: 'N'
+        options:
+          - 'N'
+          - 'N-1'
+          - 'N-2'
+      update_edp_core_workflows:
+        description: 'Update EDP Core workflows: selection of this option will update the EDP Core workflows, 
+        this should be selected if you are a common repo (e.g. maven, gradle, python, dotnet, etc.)'
+        type: boolean
+        default: true
+        required: true
+      update_datadog_workflows:
+        description: 'Update Datadog workflows: selecting this option will update the Datadog workflows, 
+        This should be selected if your repo is used for promoting Datadog resources (e.g. dashboards, monitors, log pipelines, etc.)'
+        type: boolean
+        default: false
+        required: true
+      update_container_workflows:
+        description: 'Update Container workflows: selection of this option will update the Container workflows, 
+        this should be selected if your repo builds/deploys containers'
+        type: boolean
+        default: false
+        required: true
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  call-update-workflows:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/update-workflows.yml@EDP-RELEASE-3-N
+    with:
+      branch: ${{ github.event.inputs.branch }}
+      update_edp_core_workflows: ${{ github.event.inputs.update_edp_core_workflows == 'true' }}
+      update_datadog_workflows: ${{ github.event.inputs.update_datadog_workflows == 'true' }}
+      update_container_workflows: ${{ github.event.inputs.update_container_workflows == 'true' }}
+
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}

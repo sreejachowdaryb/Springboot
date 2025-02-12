@@ -1,0 +1,115 @@
+name: edp-gt-snapshot-workflow
+on:
+  workflow_call:
+    inputs:
+      cycle:
+        description: 'EDP Cycle To Run. Only choice is "snapshot-cycle" and it is required.'
+        required: true
+        type: string
+      branch:
+        description: 'Git branch from which to build the artifact.'
+        required: true
+        type: string
+      env_path:
+        description: 'EDP Environment Path for create infrastructure and deploy component.'
+        required: false
+        default: "dev"
+        type: string
+      full_snapshot_cycle:
+        description: 'check, trigger full snapshot cycle. Uncheck, will only trigger ci session.'
+        type: string
+        required: true
+        default: "true"
+      callerWorkflowVersion:
+        required: false
+        type: string
+        default: "3.35.0"
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+jobs:
+  call-prepare-payload:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/prepare-payload.yml@3.41.2
+    with:
+      branch: ${{ inputs.branch }}
+      full_snapshot_cycle: ${{ inputs.full_snapshot_cycle }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-snapshot-workflow:
+    needs: call-prepare-payload
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/snapshot-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-prepare-payload.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-release-artifact-workflow:
+    if: needs.call-snapshot-workflow.outputs.next_cycle == 'release-artifact-cycle'
+    needs: call-snapshot-workflow
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/release-artifact-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-snapshot-workflow.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-create-infra-workflow:
+    if: |
+      fromJSON(needs.call-prepare-payload.outputs.client_payload)['edp_content']['development']['fullSnapshotCycle'] == 'true' && 
+      needs.call-snapshot-workflow.outputs.next_cycle == 'create-infra-cycle'
+    needs: [ call-prepare-payload, call-snapshot-workflow ]
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/create-infra-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-snapshot-workflow.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-deploy-components-workflow-after-snapshot:
+    needs: [ call-prepare-payload, call-snapshot-workflow ]
+    if: |
+      fromJSON(needs.call-prepare-payload.outputs.client_payload)['edp_content']['development']['fullSnapshotCycle'] == 'true' && 
+      needs.call-snapshot-workflow.outputs.next_cycle == 'deploy-components-cycle'
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/deploy-components-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-snapshot-workflow.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-deploy-components-workflow-after-create-infra:
+    needs: [ call-prepare-payload, call-create-infra-workflow ]
+    if: |
+      fromJSON(needs.call-prepare-payload.outputs.client_payload)['edp_content']['development']['fullSnapshotCycle'] == 'true' &&  
+      needs.call-create-infra-workflow.outputs.next_cycle == 'deploy-components-cycle'
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/deploy-components-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-create-infra-workflow.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  regression-testing:
+    needs: [
+      call-prepare-payload,
+      call-snapshot-workflow,
+      call-release-artifact-workflow,
+      call-create-infra-workflow,
+      call-deploy-components-workflow-after-snapshot,
+      call-deploy-components-workflow-after-create-infra]
+    if: |
+      always() &&
+      needs.call-prepare-payload.result == 'success' &&
+      (needs.call-snapshot-workflow.result == 'success' || needs.call-snapshot-workflow.result == 'skipped') &&
+      (needs.call-release-artifact-workflow.result == 'success' || needs.call-release-artifact-workflow.result == 'skipped') &&
+      (needs.call-create-infra-workflow.result == 'success' || needs.call-create-infra-workflow.result == 'skipped') &&
+      (needs.call-deploy-components-workflow-after-snapshot.result == 'success' || needs.call-deploy-components-workflow-after-snapshot.result == 'skipped') &&
+      (needs.call-deploy-components-workflow-after-create-infra.result == 'success' || needs.call-deploy-components-workflow-after-create-infra.result == 'skipped') &&
+      vars.regression_testing == 'True'
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/regression-testing-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-prepare-payload.outputs.client_payload }}
+      config_branch: ${{ inputs.branch }}

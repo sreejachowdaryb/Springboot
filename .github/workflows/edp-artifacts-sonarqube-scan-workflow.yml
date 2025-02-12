@@ -1,0 +1,140 @@
+name: edp-artifacts-sonarqube-scan-workflow
+on:
+  workflow_call:
+  # workflow_dispatch:
+    inputs:
+      artifact_name:
+        required: true
+        type: string
+        default: ''
+      component_name:
+        required: true
+        type: string
+        default: ''
+      component_type:
+        required: true
+        type: string
+        default: ''
+      version:
+        required: true
+        type: string
+        default: ''
+      branch:
+        required: true
+        type: string
+        default: ''
+      sonar_properties:
+        required: false
+        type: string
+        default: ''
+      mode:
+        required: false
+        type: string
+        default: 'async'
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+    outputs:
+      sonarqube_scan_result:
+        description: 'Sonarqube scan result'
+        value: ${{ jobs.artifact-sonarqube-scan.outputs.sonarqube_scan_result }} 
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+  LOCAL_TEST_ENV: edp-prod
+  GH_TOKEN: ${{ github.token }}
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  prepare_dev_override:
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "linux" ]
+    outputs:
+      matrix_env: ${{ env.LOCAL_TEST_ENV == 'edp-englab' && 'englab' || 'prod' }}
+    steps:
+      - name: Print environment variables
+        run: printenv
+
+  artifact-sonarqube-scan:
+    needs: prepare_dev_override
+    # Possible Labels: self-hosted,{{cloud_env}},{{region}},non-pci,privileged,{{github_runner_vm_name}}"
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "linux", "${{ matrix.env }}" ]
+    strategy:
+      matrix:
+        include:
+          - env: ${{ needs.prepare_dev_override.outputs.matrix_env }}
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+      LOCAL_TEST_ENV: edp-${{ matrix.env }}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+    outputs:
+      sonarqube_scan_result: ${{ steps.artifact-sonarqube-scan.outputs.sonarqube_scan_result }}
+    steps:
+      - name: display environments
+        run: env
+
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets for Nexus Publish
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+        # runner will only be englab or prod
+          # url: ${{ matrix.env == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          secrets: |
+            pipe/data/csl/sonarqube-token-${{ matrix.env }} sonarqube-token-${{ matrix.env }} | SONARQUBE_TOKEN;
+            pipe/data/csl/nexus-pull-username-${{ matrix.env }} nexus-pull-username-${{ matrix.env }} | NEXUS_PULL_USERNAME ;
+            pipe/data/csl/nexus-pull-password-${{ matrix.env }} nexus-pull-password-${{ matrix.env }} | NEXUS_PULL_PASSWORD ;
+
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: coverage-reports
+
+      # if you want to use workflow_dispatch to manually trigger workflow
+      # you need rename inputs.component_name --> github.event.inputs.component_name, and so on
+      - name: Artifact Sonarqube Scan
+        id: artifact-sonarqube-scan
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "artifact_sonarqube_scan"
+          COVERAGE_REPORTS_DIRECTORY: coverage-reports
+          COMPONENT_NAME: ${{ inputs.component_name }}
+          COMPONENT_TYPE: ${{ inputs.component_type }}
+          VERSION: ${{ inputs.version }}
+          BRANCH: ${{ inputs.branch }}
+          SONAR_PROPERTIES: ${{ inputs.sonar_properties }}
+          MODE: ${{ inputs.mode }}
+
+      - name: Clean Up Runner Workspace
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "clean_up_workspace"

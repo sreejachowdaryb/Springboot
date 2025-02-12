@@ -1,0 +1,206 @@
+name: codeql-scan-workflow
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: 'Git branch to run the workflow'
+        type: string
+        required: false
+        default: ""
+      callerWorkflowVersion:
+        required: false
+        type: string
+        default: "3.35.0"
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+  GH_TOKEN: ${{ github.token }}
+  LOCAL_TEST_ENV: edp-prod
+
+permissions:
+  id-token: write
+  actions: read
+  contents: write
+  security-events: write
+
+jobs:
+  call-prepare-payload:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/prepare-payload.yml@3.41.2
+    with:
+      branch: ${{ inputs.branch }}
+
+  check-code-ql:
+    needs: call-prepare-payload
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "Linux", "${{ matrix.env }}" ]
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [ '${{ needs.call-prepare-payload.outputs.matrix_env }}' ]
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+    container:
+      image: releases.registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+      options: --privileged
+    outputs:
+      advanced_security: ${{ steps.get-advanced-security.outputs.advanced_security }}
+    steps:
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          # runner will only be englab or prod
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          secrets: |
+            pipe/data/csl/github-saas-admin-token-prod github-saas-admin-token-prod | GH_ADMIN_TOKEN ;
+
+      - name: Generate Github App Token
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_ADMIN_TOKEN"
+
+      - name: Get Advanced Security for the Repository
+        id: get-advanced-security
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_advanced_security"
+
+  determine-languages:
+    needs: [ call-prepare-payload, check-code-ql ]
+    if: ${{ needs.check-code-ql.outputs.advanced_security == 'enabled' }}
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "Linux", "${{ matrix.env }}" ]
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [ '${{ needs.call-prepare-payload.outputs.matrix_env }}' ]
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+    container:
+      image: releases.registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+      options: --privileged
+    outputs:
+      languages: ${{ steps.build-language-list.outputs.result }}
+    steps:
+      - name: Build Language List
+        id: build-language-list
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "build_codeql_languages"
+          CLIENT_PAYLOAD: "${{ needs.call-prepare-payload.outputs.client_payload }}"
+
+  codeql-scan:
+    needs: [ call-prepare-payload, determine-languages, check-code-ql ]
+    if: ${{ needs.check-code-ql.outputs.advanced_security == 'enabled' && needs.determine-languages.outputs.languages }}
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "Linux", "${{ matrix.env }}" ]
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [ '${{ needs.call-prepare-payload.outputs.matrix_env }}' ]
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+    container:
+      image: releases.registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+      options: --privileged
+    steps:
+      - name: Get Azure Vault URL
+        id: get-azure-vault-url
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "get_azure_vault_url"
+
+      - name: Retrieve Vault Secrets
+        id: retrieve-vault
+        uses: hashicorp/vault-action@v3.0.0
+        with:
+          # runner will only be englab or prod
+          # url: ${{ matrix.env == 'englab' && 'https://eng.vault.td.com' || 'https://vault.td.com' }}
+          url: ${{ steps.get-azure-vault-url.outputs.azure_vault_url }}
+          method: jwt
+          path: jwt_github
+          role: pipe-github-workflow
+          exportToken: true
+          secrets: |
+            pipe/data/csl/nexus-pull-username-${{ matrix.env }} nexus-pull-username-${{ matrix.env }} | NEXUS_PULL_USERNAME ;
+            pipe/data/csl/nexus-pull-password-${{ matrix.env }} nexus-pull-password-${{ matrix.env }} | NEXUS_PULL_PASSWORD ;
+            pipe/data/csl/nexus-push-username-${{ matrix.env }} nexus-push-username-${{ matrix.env }} | NEXUS_PUSH_USERNAME ;
+            pipe/data/csl/nexus-push-password-${{ matrix.env }} nexus-push-password-${{ matrix.env }} | NEXUS_PUSH_PASSWORD ;
+            pipe/data/csl/nuget-api-token-${{ matrix.env }} nuget-api-token-${{ matrix.env }} | NUGET_API_TOKEN ;
+            pipe/data/csl/github-saas-admin-token-prod github-saas-admin-token-prod | GH_ADMIN_TOKEN ;
+
+      - name: Checkout Branch
+        id: checkout-branch
+        uses: actions/checkout@v3
+        with:
+          ref: "${{ fromJSON(needs.call-prepare-payload.outputs.client_payload)['workflows']['github_ref'] }}"
+          fetch-depth: 0
+
+      - name: Generate Github App Token
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "generate_github_app_token"
+          GH_TOKEN_KEYS: "GH_ADMIN_TOKEN"
+
+      - name: Setup Environment Variables for CodeQL
+        run: |
+          echo "PIP_INDEX=https://rp.td.com/repository/pypi-all/pypi" >> $GITHUB_ENV
+          echo "PIP_INDEX_URL=https://rp.td.com/repository/pypi-all/simple" >> $GITHUB_ENV
+          echo "PIP_TRUSTED_HOST=rp.td.com" >> $GITHUB_ENV
+
+      - name: Enable Advanced Security for the Repository
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "enable_advanced_security"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: ${{ needs.determine-languages.outputs.languages }}
+          setup-python-dependencies: false
+
+      - name: Build Artifacts
+        id: build-application
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "build_application"
+          EVENT_PAYLOAD: "${{ needs.call-prepare-payload.outputs.client_payload }}"
+          GH_TOKEN: "${{ github.token }}"
+          EDP_CYCLE_OVERRIDE: "open-pr-cycle"
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: "/language:${{ needs.determine-languages.outputs.languages }}"
+
+      - name: Clean Up Runner Workspace
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "clean_up_workspace"

@@ -1,0 +1,77 @@
+name: edp-gt-snapshot-cd-workflow
+on:
+  workflow_call:
+    inputs:
+      cycle:
+        description: 'EDP Cycle To Run. Only choice is "snapshot-cycle" and it is required.'
+        required: true
+        type: string
+        default: "snapshot-cycle"
+      branch:
+        description: 'Git branch from which to get the EDP configuration files.'
+        required: true
+        type: string
+        default: ""
+      env_path:
+        description: 'EDP Environment Path Above DEV Classification To Release To'
+        required: false
+        type: string
+        default: "dev"
+      ci_repo_name:
+        description: 'The repository name that published the artifact, default is the current repository'
+        required: false
+        type: string
+      artifact_info_key:
+        description: 'The artifact_info_key used to retrieve the artifact info from CI repository'
+        required: true
+        type: string
+      callerWorkflowVersion:
+        required: false
+        type: string
+        default: "3.35.0"
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+jobs:
+  call-snapshot-cd-workflow:
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/snapshot-cd-workflow.yml@3.41.2
+    with:
+      cycle:  ${{ inputs.cycle }}
+      branch: ${{ inputs.branch }}
+      env_path: ${{ inputs.env_path }}
+      ci_repo_name: ${{ inputs.ci_repo_name }}
+      artifact_info_key: ${{ inputs.artifact_info_key }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-create-infra-workflow:
+    needs: call-snapshot-cd-workflow
+    if: needs.call-snapshot-cd-workflow.outputs.next_cycle == 'create-infra-cycle'
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/create-infra-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-snapshot-cd-workflow.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-deploy-components-workflow-after-release:
+    needs: call-snapshot-cd-workflow
+    if: needs.call-snapshot-cd-workflow.outputs.next_cycle == 'deploy-components-cycle'
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/deploy-components-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-snapshot-cd-workflow.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}
+
+  call-deploy-components-workflow-after-create-infra:
+    needs: call-create-infra-workflow
+    if: needs.call-create-infra-workflow.outputs.next_cycle == 'deploy-components-cycle'
+    uses: TD-Github-Actions/edp-reusable-workflows/.github/workflows/deploy-components-workflow.yml@3.41.2
+    with:
+      client_payload: ${{ needs.call-create-infra-workflow.outputs.client_payload }}
+    secrets:
+      ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG }}

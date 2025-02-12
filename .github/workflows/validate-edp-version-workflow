@@ -1,0 +1,96 @@
+name: validate-edp-version-workflow
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+        default: ''
+      callerWorkflowVersion:
+        required: false
+        type: string
+        default: "3.35.0"
+
+    secrets:
+      ACTIONS_CONTAINER_DEBUG:
+        required: false
+
+    outputs:
+        edp_version_tag:
+            description: "The EDP version tag for next workflow"
+            value: ${{ jobs.validate-edp-version.outputs.edp_version_tag }}
+
+env:
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  ACTIONS_CONTAINER_DEBUG: ${{ secrets.ACTIONS_CONTAINER_DEBUG || secrets.ACTIONS_STEP_DEBUG }}
+  LOCAL_TEST_ENV: edp-prod
+  GH_TOKEN: ${{ github.token }}
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  determine-environment:
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "Linux" ]
+    outputs:
+      matrix_env: ${{ env.LOCAL_TEST_ENV == 'edp-englab' && 'englab' || 'prod' }}
+    steps:
+      - name: Print environment variables
+        run: printenv
+
+  validate-edp-version:
+    needs: determine-environment
+    # Possible Labels: self-hosted,{{cloud_env}},{{region}},non-pci,privileged,{{github_runner_vm_name}}"
+    runs-on: 
+      group: enterprise/Default
+      labels: [ "self-hosted", "Linux", "${{ matrix.env }}" ]
+    strategy:
+      matrix:
+        include:
+          - env: ${{ needs.determine-environment.outputs.matrix_env }}
+    env:
+      CLOUD_ENV: ${{ matrix.env }}
+      LOCAL_TEST_ENV: edp-${{ matrix.env }}
+    container:
+      image: registry.td.com/td/pipe/edp-core-github-actions:3.41.2
+      volumes:
+        - /opt/edp-tools:/edp-tools
+        - /etc/salt/grains:/etc/salt/grains
+    outputs:
+        edp_version_tag: ${{ steps.validate-edp-version.outputs.result }}
+
+    steps:
+      - name: display environments
+        run: env
+
+      - name: Checkout Branch
+        id: checkout-branch
+        uses: actions/checkout@v3
+        with:
+          ref: "${{ inputs.branch }}"
+          fetch-depth: 0
+
+      - name: Validate EDP Version
+        id: validate-edp-version
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "validate_edp_version"
+
+      - name: Send Notification
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "send_notification"
+          GH_TOKEN: "${{ github.token }}"
+          JOB_STATUS: "${{ job.status }}"
+          JOB_NAME_INCLUDE: "${{ matrix.env }}"
+
+      - name: Clean Up Runner Workspace
+        if: ${{ always() }}
+        run: "python3 /app/main.py"
+        env:
+          INPUT_FUNCTION: "clean_up_workspace"
